@@ -1,0 +1,212 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ML Pipeline Infrastructure - Sentiment Analysis on AWS'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ml-pipeline
+    Description: Project name for resource naming
+  
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+  
+  BucketName:
+    Type: String
+    Description: S3 bucket name for models and data (must be globally unique)
+  
+  LambdaMemorySize:
+    Type: Number
+    Default: 2048
+    Description: Lambda function memory size in MB
+  
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    Description: Lambda function timeout in seconds
+
+Resources:
+  # S3 Bucket for models and data
+  MLPipelineBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${MLPipelineBucket}/*'
+                  - !GetAtt MLPipelineBucket.Arn
+
+  # Lambda Function for sentiment prediction
+  SentimentEndpointFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-sentiment-endpoint-${Environment}'
+      Runtime: python3.9
+      Handler: cloud_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref MLPipelineBucket
+        S3Key: functions/sentiment-endpoint.zip
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Environment:
+        Variables:
+          MODEL_PATH: !Sub 's3://${MLPipelineBucket}/models/sentiment_model'
+          BUCKET_NAME: !Ref MLPipelineBucket
+      Description: ML Pipeline Sentiment Analysis Endpoint
+
+  # API Gateway for Lambda
+  SentimentApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-api-${Environment}'
+      Description: API Gateway for ML Pipeline sentiment endpoint
+
+  # API Gateway Resource
+  PredictResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SentimentApi
+      ParentId: !GetAtt SentimentApi.RootResourceId
+      PathPart: predict
+
+  # API Gateway Method
+  PredictMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SentimentApi
+      ResourceId: !Ref PredictResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SentimentEndpointFunction.Arn}/invocations'
+
+  # Lambda Permission for API Gateway
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SentimentEndpointFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SentimentApi}/*/*'
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: PredictMethod
+    Properties:
+      RestApiId: !Ref SentimentApi
+      StageName: !Ref Environment
+
+  # MSK Cluster for Kafka (optional - commented out due to cost)
+  # MSKCluster:
+  #   Type: AWS::MSK::Cluster
+  #   Properties:
+  #     ClusterName: !Sub '${ProjectName}-kafka-${Environment}'
+  #     KafkaVersion: '2.8.1'
+  #     NumberOfBrokerNodes: 2
+  #     BrokerNodeGroupInfo:
+  #       InstanceType: kafka.m5.large
+  #       ClientSubnets:
+  #         - !Ref Subnet1
+  #         - !Ref Subnet2
+  #       SecurityGroups:
+  #         - !Ref MSKSecurityGroup
+
+  # EMR Cluster for Spark (optional - use for processing)
+  # EMRCluster:
+  #   Type: AWS::EMR::Cluster
+  #   Properties:
+  #     Name: !Sub '${ProjectName}-spark-${Environment}'
+  #     ReleaseLabel: emr-6.15.0
+  #     Applications:
+  #       - Name: Spark
+  #     Instances:
+  #       MasterInstanceGroup:
+  #         InstanceCount: 1
+  #         InstanceType: m5.xlarge
+  #       CoreInstanceGroup:
+  #         InstanceCount: 2
+  #         InstanceType: m5.xlarge
+  #     ServiceRole: EMR_DefaultRole
+  #     JobFlowRole: EMR_EC2_DefaultRole
+
+Outputs:
+  BucketName:
+    Description: S3 bucket name
+    Value: !Ref MLPipelineBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  BucketArn:
+    Description: S3 bucket ARN
+    Value: !GetAtt MLPipelineBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+
+  LambdaFunctionName:
+    Description: Lambda function name
+    Value: !Ref SentimentEndpointFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionName'
+
+  LambdaFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt SentimentEndpointFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunctionArn'
+
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${SentimentApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/predict'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  LambdaExecutionRoleArn:
+    Description: Lambda execution role ARN
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaExecutionRoleArn'
+

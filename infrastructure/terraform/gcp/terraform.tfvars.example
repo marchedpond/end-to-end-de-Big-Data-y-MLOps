@@ -1,0 +1,9 @@
+# Copy this file to terraform.tfvars and fill in your values
+
+project_id   = "your-gcp-project-id"
+region       = "us-central1"
+zone         = "us-central1-a"
+bucket_name  = "ml-pipeline-bucket-12345"  # Must be globally unique
+function_name = "sentiment-endpoint"
+environment  = "dev"
+
